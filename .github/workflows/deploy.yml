@@ -1,0 +1,72 @@
+name: Publish and deploy
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: mern-ec2
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Test frontend
+        working-directory: react-src
+        run: |
+          npm ci
+          npm test
+      - name: Build and publish
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          prefix="ghcr.io/${GITHUB_REPOSITORY,,}"
+          web="$prefix-web:$GITHUB_SHA"
+          api="$prefix-api:$GITHUB_SHA"
+          docker build -t "$web" ./react-src
+          docker build -t "$api" .
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$web"
+          docker push "$api"
+  deploy:
+    needs: publish
+    runs-on: [self-hosted, linux, x64, ec2-deploy]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Deploy to EC2
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          prefix="ghcr.io/${GITHUB_REPOSITORY,,}"
+          deploy_dir="$HOME/mern-deploy"
+          mkdir -p "$deploy_dir"
+          cp compose.deploy.yaml "$deploy_dir/"
+          cd "$deploy_dir"
+          printf 'WEB_IMAGE=%s-web:%s\nAPI_IMAGE=%s-api:%s\n' \
+            "$prefix" "$GITHUB_SHA" "$prefix" "$GITHUB_SHA" > .env
+
+          docker_config="$(mktemp -d)"
+          trap 'sudo -n rm -f -- "$docker_config/config.json"; rmdir -- "$docker_config"' EXIT
+          printf '%s' "$GHCR_TOKEN" | sudo -n docker --config "$docker_config" \
+            login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          sudo -n docker --config "$docker_config" compose -f compose.deploy.yaml \
+            up -d --pull always --wait --wait-timeout 120
+          curl -fsS --retry 5 --retry-all-errors http://127.0.0.1/api/health
